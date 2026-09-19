@@ -1,0 +1,18 @@
+{
+  "name": "tana-to-tine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Convert Tana JSON exports into Tine Markdown graphs",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "import": "node tana-to-tine.mjs",
+    "refresh-assets": "node refresh-assets.mjs"
+  },
+  "dependencies": {
+    "entities": "8.1.0",
+    "htmlparser2": "12.0.0",
+    "unicode-case-folding": "1.1.1"
+  }
+}
