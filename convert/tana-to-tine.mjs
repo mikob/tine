@@ -9,6 +9,7 @@ import { Converter } from './tana_tine/converter.mjs';
 import { Source } from './tana_tine/model.mjs';
 import { buildAssetMap, digest, resolvePath, statIfExists } from './asset-cache.mjs';
 import { availableWorkers, mapConcurrent, mapWorkers, validateJobs } from './workers.mjs';
+import { applyImportDecisions, recordImportDecisions } from './import-decisions.mjs';
 
 export const CONFIG = `{:meta/version 1
  :preferred-format "Markdown"
@@ -109,6 +110,10 @@ export async function run(args, { log = progress } = {}) {
     log(`Mapping ${source.nodes.size} unique source nodes`);
     converter.assets = assets;
     converter.finish();
+    if (args.decisions) {
+      log('Applying source field and page decisions');
+      await applyImportDecisions(converter, JSON.parse(await fs.readFile(args.decisions, 'utf8')), args.jobs);
+    }
     log(`Serializing ${converter.pages.size} pages in parallel`);
     const rendered = await mapWorkers('serializePage', converter.pages.values(), args.jobs);
     const expected = [];
@@ -128,6 +133,7 @@ export async function run(args, { log = progress } = {}) {
     await mapConcurrent(source.files.map(info => [info.path, path.join(stage, 'assets/tana-source/exports', `${info.workspace}.json`), info.sha256]), args.jobs, archiveExport);
     await mapConcurrent(converter.definitions, args.jobs, ([relative, definition]) => jsonWrite(path.join(stage, relative), definition));
     const manifest = converter.manifest(expected, files);
+    recordImportDecisions(manifest, converter);
     manifest.run = { jobs: args.jobs, elapsed_seconds: elapsed(started), assets_requested: !args.skipAssets,
       download_requested: !args.noDownload && !args.skipAssets };
     await jsonWrite(path.join(stage, 'assets.json'), assets);
@@ -161,6 +167,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     'root-workspace': { type: 'string' }, 'shared-workspace': { type: 'string', multiple: true, default: [] },
     'workspace-title': { type: 'string', multiple: true, default: [] }, 'field-name': { type: 'string', multiple: true, default: [] },
     jobs: { type: 'string', default: String(availableCores()) }, 'asset-cache': { type: 'string', multiple: true, default: [] },
+    decisions: { type: 'string' },
     'no-download': { type: 'boolean', default: false }, 'skip-assets': { type: 'boolean', default: false },
     overwrite: { type: 'boolean', default: false }, help: { type: 'boolean', short: 'h', default: false },
   } });
@@ -170,7 +177,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
   validateJobs(jobs);
   return { input: values.input, output: values.output, rootWorkspace: values['root-workspace'] ?? null,
     sharedWorkspace: values['shared-workspace'], workspaceTitle: values['workspace-title'], fieldName: values['field-name'], jobs,
-    assetCache: values['asset-cache'], noDownload: values['no-download'], skipAssets: values['skip-assets'], overwrite: values.overwrite };
+    assetCache: values['asset-cache'], noDownload: values['no-download'], skipAssets: values['skip-assets'], overwrite: values.overwrite,
+    decisions: values.decisions ?? null };
 }
 
 const HELP = `Usage: node tana-to-tine.mjs --input EXPORT --output GRAPH [options]
@@ -179,6 +187,7 @@ const HELP = `Usage: node tana-to-tine.mjs --input EXPORT --output GRAPH [option
   --shared-workspace NAME           Shared schema/content; repeatable
   --workspace-title WORKSPACE=TITLE  Override an ordinary workspace page title
   --field-name SOURCE_FIELD_ID=KEY   Explicit normalized field key; repeatable
+  --decisions FILE                  Source-ID field/page merges, renames and exclusions
   --jobs N                         Parallel workers (default: all available cores)
   --asset-cache DIR                Existing attachment cache; repeatable
   --no-download                    Reuse local/cache bytes without network requests

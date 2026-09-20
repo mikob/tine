@@ -49,6 +49,26 @@ export function isoDay(value) {
   if (year < 1 || month < 1 || month > 12 || day < 1 || day > days[month - 1]) throw new RangeError('Invalid calendar date: ' + value);
   return value;
 }
+/** Daily anchors for Tana periods: Sunday-start ISO week, month start, year start. */
+export function calendarAnchor(value) {
+  if (typeof value !== 'string') return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return isoDay(value);
+  if (/^\d{4}-\d{2}$/.test(value)) return isoDay(value + '-01');
+  if (/^\d{4}$/.test(value)) return isoDay(value + '-01-01');
+  const week = value.match(/^(\d{4})-W(\d{2})$/);
+  if (!week) return null;
+  const year = Number(week[1]), number = Number(week[2]), dayMs = 86400000;
+  isoDay(week[1] + '-01-04');
+  const weekOne = weekYear => {
+    const date = new Date(0);
+    date.setUTCFullYear(weekYear, 0, 4);
+    return date.getTime() - ((date.getUTCDay() + 6) % 7) * dayMs;
+  };
+  const monday = weekOne(year), weeks = (weekOne(year + 1) - monday) / (7 * dayMs);
+  if (number < 1 || number > weeks) throw new RangeError('Invalid calendar week: ' + value);
+  const sunday = new Date(monday + ((number - 1) * 7 - 1) * dayMs).toISOString().slice(0, 10);
+  return isoDay(sunday);
+}
 export function journalTitle(day) {
   if (!isoDay(day)) throw new RangeError('Invalid journal date: ' + day);
   const [year, month, date] = day.split('-').map(Number);
@@ -73,6 +93,29 @@ export function encodePageName(name) {
   const body = result.split('.')[0].replace(/ +$/, '').toUpperCase();
   if (/^(?:CON|PRN|AUX|NUL|(?:COM|LPT)[1-9¹²³])$/.test(body)) result = percentEncode(result[0]) + result.slice(1);
   return result;
+}
+/** Filename identity for the converter's triple-lowbar/default journal config. */
+export function pageNameFromPath(filename) {
+  const stem = path.basename(filename, path.extname(filename)).replaceAll('___', '/');
+  const payload = Buffer.from(stem), decoded = [];
+  for (let index = 0; index < payload.length; index++) {
+    const hex = payload.subarray(index + 1, index + 3).toString('latin1');
+    if (payload[index] === 37 && /^[0-9a-f]{2}$/i.test(hex)) {
+      decoded.push(parseInt(hex, 16));
+      index += 2;
+    } else decoded.push(payload[index]);
+  }
+  const name = Buffer.from(decoded).toString('utf8');
+  if (/^\d{4}(?:-\d{2}-|_\d{2}_)\d{2}$/.test(name)) {
+    // An invalid date-looking filename remains an ordinary page in Tine.
+    try { return journalTitle(name.replaceAll('_', '-')); }
+    catch (error) { if (!(error instanceof RangeError)) throw error; }
+  }
+  return name;
+}
+export function pageProperties(page) {
+  return page.name === pageNameFromPath(page.path)
+    ? {...page.properties} : {title: page.name, ...page.properties};
 }
 export class Names {
   logical = new Map();
@@ -211,12 +254,14 @@ export class Source {
     return this.activeCache.get(identity);
   }
   calendarDate(identity) {
-    for (const value of this.setting(identity, 'SYS_A82', {meta: true})) {
+    for (const value of [...this.setting(identity, 'SYS_A169', {meta: true}), ...this.setting(identity, 'SYS_A82', {meta: true})]) {
       const dates = datesIn(this.name(value));
       if (dates.length) return dates[0].dateTimeString ?? null;
     }
     const name = this.name(identity);
-    return this.kind(identity) === 'journalPart' && /^\d{4}-\d{2}-\d{2}/.test(name) ? name.slice(0, 10) : null;
+    if (this.kind(identity) !== 'journalPart') return null;
+    if (/^\d{4}-\d{2}-\d{2}/.test(name)) return name.slice(0, 10);
+    return /^(?:\d{4}(?:-\d{2}|-W\d{2})?)$/.test(name) ? name : null;
   }
   dayContext(identity) {
     if (!this.days.has(identity)) {
@@ -284,7 +329,8 @@ export function propertyLines(properties) {
   });
 }
 export function serializePage(page) {
-  const lines = [...propertyLines({title: page.name, ...page.properties}), ''];
+  const header = propertyLines(pageProperties(page));
+  const lines = header.length ? [...header, ''] : [];
   const expected = [];
   function append(block, depth, parent) {
     if (depth >= 128) throw new Error("Tine's outline depth limit (128) exceeded by " + block.uuid);

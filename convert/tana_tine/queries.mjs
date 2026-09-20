@@ -40,18 +40,18 @@ function difference(left, right) {
  * bound imported rows; unbounded or generated matches require a snapshot. */
 export class NativeScope {
   constructor(graph) {
-    this.active = new Set();
-    this.archived = new Set();
-    this.archivePage = graph.archivePage?.name ?? null;
+    this.sourceBlocks = new Set();
     this.tags = new Map();
     this.properties = new Map();
     this.references = new Map();
     this.tasks = new Set();
 
-    const walk = (block, inheritedRefs, archived) => {
+    const walk = (block, inheritedRefs) => {
       const identity = block.uuid;
-      if (archived) this.archived.add(identity);
-      if (block.sourceId && graph.source.active(block.sourceId)) this.active.add(identity);
+      // A source note explicitly retained through a live reference is ordinary
+      // graph content, even if Tana had archived it. No Tana activity predicate
+      // belongs in the user's native queries.
+      if (block.sourceId && graph.source.nodes.has(block.sourceId)) this.sourceBlocks.add(identity);
       for (const tag of graph.nativeTags.get(identity) ?? []) addMember(this.tags, tag, identity);
       const references = new Set(inheritedRefs);
       // These scans deliberately include code/escaped links: overapproximation
@@ -67,11 +67,11 @@ export class NativeScope {
           && /(?<![\p{L}\p{N}_-])(?:TODO|DOING|DONE|NOW|LATER|WAITING|WAIT|CANCELED|CANCELLED|STARTED|IN-PROGRESS)(?![\p{L}\p{N}_-])/u.test(block.text)) {
         this.tasks.add(identity);
       }
-      for (const child of block.children) walk(child, references, archived);
+      for (const child of block.children) walk(child, references);
     };
 
     for (const page of graph.pages.values()) {
-      for (const block of page.blocks) walk(block, new Set([pageIdentity(page.name)]), page === graph.archivePage);
+      for (const block of page.blocks) walk(block, new Set([pageIdentity(page.name)]));
     }
   }
 
@@ -91,24 +91,18 @@ export class NativeScope {
   }
 
   validate(scope) {
-    let candidates = this.candidates(scope);
+    const candidates = this.candidates(scope);
     if (candidates === null) {
       throw new UnsupportedQuery("Query has no positive tag, task, authored-field, or page-reference scope; native search would include generated content");
     }
-    const archived = intersection(candidates, this.archived);
-    candidates = difference(candidates, this.archived);
-    const unintended = difference(candidates, this.active);
+    const unintended = difference(candidates, this.sourceBlocks);
     if (unintended.size) {
-      throw new UnsupportedQuery(`Native predicates may also match ${unintended.size} inactive or generated blocks; source activity cannot be filtered without internal metadata`);
+      throw new UnsupportedQuery(`Native predicates may also match ${unintended.size} missing or generated blocks`);
     }
     const result = {
       method: "conservative-native-candidate-bound", candidate_count: candidates.size,
-      inactive_or_generated_candidates: 0,
+      non_source_candidates: 0,
     };
-    if (this.archivePage) {
-      result.excluded_page = this.archivePage;
-      result.excluded_candidates = archived.size;
-    }
     return result;
   }
 }

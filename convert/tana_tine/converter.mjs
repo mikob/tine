@@ -1,13 +1,21 @@
 /** Merge workspace outlines into an ordinary, loss-aware Tine graph. */
 import {decodeHTML} from 'entities';
-import {Block, Page, Names, CONTENT_KINDS, METADATA_KINDS, datesIn, isoDay, journalTitle,
-  safeProse, sourceUuid, stableUuid, appendTo, extend, unique, compare, countBy} from './model.mjs';
-import {Compiler, NativeScope, UnsupportedQuery, quoted, viewSettings} from './queries.mjs';
+import {Block, Page, Names, CONTENT_KINDS, METADATA_KINDS, datesIn, isoDay, calendarAnchor, journalTitle,
+  safeProse, sourceUuid, stableUuid, appendTo, extend, unique, compare, countBy, pageProperties} from './model.mjs';
+import {Compiler, NativeScope, UnsupportedQuery, viewSettings} from './queries.mjs';
 import {RichText, codeFence, escapeSourceHashtags} from './richtext.mjs';
 
 const TASK_MARKERS = new Set(['TODO', 'DOING', 'DONE', 'NOW', 'LATER', 'WAITING', 'WAIT', 'CANCELED', 'CANCELLED', 'STARTED', 'IN-PROGRESS']);
 export const RESERVED_KEYS = new Set(['id', 'title', 'tags', 'alias', 'aliases', 'state', 'priority', 'scheduled', 'deadline', 'page', 'collapsed', 'public', 'heading', 'icon', 'file', 'template', 'filters', 'logseq.order-list-type']);
 export const INTERNAL_KEYS = new Set(['hl-page', 'hl-color', 'hl-type', 'ls-type', 'background-color', 'template-including-parent']);
+export function titleMatchesDay(value, day) {
+  if (!day) return false;
+  if (value.replaceAll('/', '-') === day) return true;
+  // Some older imported journal titles use year/day/month. Only recognize the
+  // unambiguous case; a plausible month must not be silently reinterpreted.
+  const swapped = value.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+  return Boolean(swapped && Number(swapped[2]) > 12 && `${swapped[1]}-${swapped[3]}-${swapped[2]}` === day);
+}
 const has = (object, key) => Object.hasOwn(object, key);
 const sorted = values => [...values].sort(compare);
 function jsonText(value) {
@@ -75,8 +83,8 @@ export class Converter {
     this.fieldNames = {...fieldNames};
     validateFieldNames(source, this.fieldNames);
     this.names = new Names();
-    for (const key of ['pages', 'pageFor', 'refs', 'fields', 'fieldUses', 'fieldAssignments', 'scalarIds', 'plainCache', 'tagCache', 'occurrences', 'definitions', 'nativeTags', 'daySources', 'dayGroups', 'representations', 'legacyBlockIds']) this[key] = new Map();
-    for (const key of ['tags', 'emitted', 'required', 'plainStack']) this[key] = new Set();
+    for (const key of ['pages', 'pageFor', 'refs', 'fields', 'fieldUses', 'fieldAssignments', 'scalarIds', 'plainCache', 'tagCache', 'occurrences', 'definitions', 'nativeTags', 'daySources', 'dayGroups', 'representations', 'legacyBlockIds', 'periodAnchors']) this[key] = new Map();
+    for (const key of ['tags', 'emitted', 'required', 'plainStack', 'nativeValues', 'calendarNavigation', 'journalGroupIds']) this[key] = new Set();
     this.issues = [];
     this.queries = [];
     this.nativeQueries = [];
@@ -86,8 +94,8 @@ export class Converter {
     this.viewsProcessed = 0;
     this.uuidSources = new Map([...source.nodes.keys()].map(identity => [sourceUuid(identity), identity]));
     this.recoveredPage = null;
-    this.archivePage = null;
-    this.index = this.newPage('generated:import-index', 'Tana import', 'import-index');
+    // Flattened workspace navigation is temporary bookkeeping, not a graph page.
+    this.index = new Page('', '', 'workspace-navigation');
   }
   issue(code, identity = null, details = {}) { this.issues.push({code, source_id: identity, ...details}); }
   newPage(identity, name, kind, sourceId = null) {
@@ -130,8 +138,25 @@ export class Converter {
     const value = date.dateTimeString;
     if (typeof value !== 'string') throw new Error('Inline date has no dateTimeString');
     if (plain) return value;
-    if (isoDay(value) && !['endDateTimeString', 'endDate', 'timeZone', 'timezone'].some(key => has(date, key))) return '[[' + this.dayPage(value).name + ']]';
+    if (/^\d{4}(?:-\d{2}|-W\d{2})?$/.test(value)) {
+      const day = calendarAnchor(value);
+      const reference = this.dateReference({...date, dateTimeString: day});
+      return reference.replace(/^(\[\[[^\]]+\]\])/, target => '[' + value + '](' + target + ')');
+    }
     const extras = Object.fromEntries(Object.entries(date).filter(([key]) => key !== 'dateTimeString'));
+    const endpoints = value.split('/').map(part => part.match(/^(\d{4}-\d{2}-\d{2})(?:T((?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?))?$/));
+    if (endpoints.length <= 2 && endpoints.every(Boolean)) {
+      const timed = endpoints.some(endpoint => endpoint[2]);
+      const rendered = endpoints.map(([, day, time]) => '[[' + this.dayPage(isoDay(day)).name + ']]' + (time ? ' ' + time : '')).join(' – ');
+      // An all-day date already names its local day; do not shift it through UTC.
+      // Timed references retain their exact clock precision, offset and timezone.
+      const zones = unique(['timezone', 'timeZone'].filter(key => typeof extras[key] === 'string').map(key => {
+        const zone = extras[key]; delete extras[key]; return zone;
+      }));
+      if (typeof extras.hasTime === 'boolean' && extras.hasTime === timed) delete extras.hasTime;
+      return rendered + (timed && zones.length ? ' (' + zones.join(', ') + ')' : '')
+        + (Object.keys(extras).length ? ' (' + jsonText(extras) + ')' : '');
+    }
     return value + (Object.keys(extras).length ? ' (' + jsonText(extras) + ')' : '');
   }
   assetReference(target, label, image = false) {
@@ -162,6 +187,7 @@ export class Converter {
       const match = args.at(-1);
       if (match.code) return args[0];
       const uuid = match.uuid.toLowerCase();
+      if (this.journalGroupIds.has(uuid)) return args[0];
       return this.reference(this.legacyBlockIds.get(uuid) ?? this.uuidSources.get(uuid) ?? uuid);
     });
     return escapeSourceHashtags(safeProse(rewritten));
@@ -239,14 +265,18 @@ export class Converter {
     for (const identity of sorted([...this.tags].filter(tag => !this.fields.has(tag)))) this.newPage(identity, this.plain(identity), 'tag', identity);
     for (const identity of active) {
       if (source.kind(identity) !== 'journalPart') continue;
-      const day = isoDay(source.calendarDate(identity));
-      if (!day) continue;
-      const page = this.dayPage(day);
-      page.sourceIds.push(identity);
-      appendTo(this.daySources, day, [identity]);
+      const period = source.calendarDate(identity), day = calendarAnchor(period);
+      if (!day) throw new Error('Unrecognized source calendar period: ' + identity);
+      this.periodAnchors.set(identity, day);
+      if (isoDay(period)) {
+        const page = this.dayPage(day);
+        page.sourceIds.push(identity);
+        appendTo(this.daySources, day, [identity]);
+      }
       const workspace = source.workspace.get(identity);
-      this.refs.set(identity, workspace === this.rootWorkspace ? {type: 'page', target: page.name}
+      this.refs.set(identity, workspace === this.rootWorkspace ? {type: 'page', target: journalTitle(day)}
         : {type: 'block', target: stableUuid('journal-group:' + source.roots.get(workspace) + ':' + day)});
+      if (workspace !== this.rootWorkspace) this.journalGroupIds.add(this.refs.get(identity).target);
     }
     for (const [workspace, home] of source.homes) {
       const root = source.roots.get(workspace);
@@ -258,7 +288,7 @@ export class Converter {
         this.refs.set(home, {type: 'block', target: sourceUuid(home)});
         this.refs.set(root, this.refs.get(home));
         for (const identity of [...source.children(home), ...source.children(root + '_STASH')]) {
-          if (!this.pageFor.has(identity) && source.kind(identity) !== 'tuple') this.newPage(identity, this.plain(identity), 'root', identity);
+          if (!this.pageFor.has(identity) && !['tuple', 'journal', 'journalPart'].includes(source.kind(identity))) this.newPage(identity, this.plain(identity), 'root', identity);
         }
       }
       for (const container of [root + '_SEARCHES', root + '_CAPTURE_INBOX', root + '_SCHEMA']) {
@@ -360,7 +390,10 @@ export class Converter {
     const key = String(owner) + ':' + slot + ':' + identity;
     const count = (this.occurrences.get(key) ?? 0) + 1;
     this.occurrences.set(key, count);
-    return this.generated('occurrence:' + key + ':' + count, this.reference(identity));
+    const block = this.generated('occurrence:' + key + ':' + count, this.reference(identity));
+    if (this.source.props(identity)._ownerId === owner && ['journal', 'journalPart'].includes(this.source.kind(identity))
+      && ['home', 'journal', 'journalPart'].includes(this.source.kind(owner))) this.calendarNavigation.add(block.uuid);
+    return block;
   }
   metadata(identity, block) {
     const source = this.source, data = source.props(identity);
@@ -388,6 +421,7 @@ export class Converter {
   }
   emitField(tupleId, field, values, block) {
     const descriptor = this.fields.get(field), source = this.source, key = descriptor.key;
+    if (this.emitNativeField(tupleId, field, values, block)) return;
     let converted = [], rich = [];
     for (const identity of values) {
       let value = this.tryScalar(field, identity);
@@ -414,6 +448,42 @@ export class Converter {
       block.children.push(holder);
       this.emitted.add(tupleId);
     }
+  }
+  emitNativeField(tupleId, field, values, block) {
+    const source = this.source, descriptor = this.fields.get(field);
+    const name = descriptor.source_name.trim().toLowerCase();
+    if (!['heading', 'title'].includes(name) || values.length !== 1) return false;
+    const identity = values[0], value = this.plain(identity).trim();
+    // Rich values and shared records are real content, not presentation hints.
+    if (source.props(identity)._ownerId !== tupleId || source.kind(identity) !== 'node'
+      || source.children(identity).length || source.tags(identity).length || source.props(identity).description
+      || /[\r\n]/.test(source.name(identity)) || /<[^>]+>/.test(source.name(identity))) return false;
+    let representation;
+    if (name === 'heading') {
+      if (!/^[1-6]$/.test(value) || source.kind(source.props(tupleId)._ownerId) === 'codeblock') return false;
+      const heading = block.text.match(/^(#{1,6})\s/);
+      if (heading && heading[1].length !== Number(value)) return false;
+      if (!heading) block.text = '#'.repeat(Number(value)) + ' ' + block.text;
+      representation = 'native-heading';
+    } else {
+      const owner = source.props(tupleId)._ownerId;
+      const day = source.kind(owner) === 'journalPart' ? isoDay(source.calendarDate(owner)) : null;
+      if (value && (value === this.plain(owner).trim() || titleMatchesDay(value, day))) {
+        representation = 'redundant-title';
+      } else if (value && !source.name(owner).trim() && !block.text.trim()) {
+        block.text = this.rich(source.name(identity));
+        representation = 'native-title';
+      } else return false;
+    }
+    const record = {status: representation, owner: block.uuid, value, field, tuple_id: tupleId};
+    this.nativeValues.add(identity);
+    this.representations.set(identity, record);
+    this.representations.set(tupleId, {...record, values: [...values]});
+    // A property predicate cannot retain its meaning after native presentation
+    // replaces some values. Preserve such searches in the JSON audit instead.
+    descriptor.query_safe = false;
+    this.issue('field-mapped-to-native-content', tupleId, {field, representation});
+    return true;
   }
   emitChildren(identity, block) {
     const source = this.source;
@@ -491,6 +561,9 @@ export class Converter {
           } else anchor.children.push(this.occurrence(child, home, index));
         });
         this.index.blocks.push(anchor);
+        for (const child of source.children(home)) {
+          if (source.kind(child) === 'journal' && !this.emitted.has(child)) this.index.blocks.push(this.emitNode(child));
+        }
         if (source.views(home).length) this.viewTargets.push([home, anchor]);
       } else {
         const page = this.pageFor.get(home);
@@ -516,6 +589,9 @@ export class Converter {
         (flattened ? this.index : this.pageFor.get(home)).blocks.push(holder);
         this.representations.set(library, {status: 'library', workspace, uuid: holder.uuid});
       }
+    }
+    for (const identity of this.periodAnchors.keys()) {
+      if (!isoDay(source.calendarDate(identity)) && !this.emitted.has(identity)) this.index.blocks.push(this.emitNode(identity));
     }
     for (const [day, sourceIds] of [...this.daySources].sort(([a], [b]) => compare(a, b))) {
       const page = this.dayPage(day);
@@ -586,10 +662,10 @@ export class Converter {
       block.text = '{{tine-query ' + expression + '}}';
       Object.assign(record, {status: 'translated', expression});
       if (compiler.adaptations.size) record.native_adaptations = [...compiler.adaptations.values()];
-      this.nativeQueries.push([record, block, compiler.scope, label]);
+      this.nativeQueries.push([record, block, compiler.scope]);
     } catch (error) {
       if (!(error instanceof UnsupportedQuery)) throw error;
-      this.querySnapshot(record, block, label, error.message);
+      this.querySnapshot(record, block, error.message);
     }
     if (view) {
       const [settings, limitations] = viewSettings(this, view);
@@ -598,30 +674,53 @@ export class Converter {
       record.view_limitations = limitations;
       for (const limitation of limitations) this.issue('view-setting-degraded', view, {reason: limitation});
     }
-    block.children.push(this.generated('definition-link:' + identity + ':' + suffix, '[Original search and view definition](../' + record.source_definition_path + ')'));
     this.queries.push(record);
     return block;
   }
-  querySnapshot(record, block, label, reason) {
+  querySnapshot(record, block, reason) {
     const identity = record.source_id, view = record.view_id;
-    Object.assign(record, {status: 'snapshot', expression: null, reason});
-    block.text = 'Source search: ' + escapeSourceHashtags(label || this.plain(identity));
+    Object.assign(record, {status: 'snapshot', expression: null, reason, visible: false});
+    block.text = '';
     block.properties = {};
-    block.children.unshift(this.generated('query-limit:' + identity + ':' + (view || 'default'), 'Live query unavailable: ' + reason));
     this.issue('query-preserved-as-snapshot', identity, {view_id: view, reason});
+  }
+  pruneQuerySnapshots() {
+    const omitted = new Set(this.queries.filter(record => record.status === 'snapshot').map(record => record.uuid));
+    const references = new Set();
+    const scan = value => { for (const match of value.matchAll(/\(\(([\da-f-]{36})\)\)/gi)) references.add(match[1].toLowerCase()); };
+    const walk = block => {
+      if (omitted.has(block.uuid)) return;
+      scan(block.text);
+      Object.values(block.properties).forEach(scan);
+      block.children.forEach(walk);
+    };
+    for (const page of [...this.pages.values(), this.index]) {
+      Object.values(page.properties).forEach(scan);
+      page.blocks.forEach(walk);
+    }
+    const dailyViews = new Set([...this.daySources.values()].flat().map(identity => stableUuid('generated:day-views:' + identity)));
+    const prune = blocks => blocks.filter(block => {
+      if (omitted.has(block.uuid)) return false;
+      block.children = prune(block.children);
+      if (block.children.length || Object.keys(block.properties).length) return true;
+      if (dailyViews.has(block.uuid)) return false;
+      const identity = block.sourceId;
+      if (!identity || this.source.kind(identity) !== 'search' || references.has(block.uuid)
+        || this.source.tags(identity).length || has(this.source.props(identity), '_done')) return true;
+      this.required.delete(identity);
+      this.representations.set(identity, {status: 'json-query', definitions: this.queries.filter(q => q.source_id === identity).map(q => q.source_definition_path)});
+      return false;
+    });
+    for (const page of [...this.pages.values(), this.index]) page.blocks = prune(page.blocks);
   }
   validateNativeQueries() {
     const scope = new NativeScope(this);
-    for (const [record, block, candidates, label] of this.nativeQueries) {
+    for (const [record, block, candidates] of this.nativeQueries) {
       try {
         record.scope_validation = scope.validate(candidates);
-        if (this.archivePage) {
-          record.expression += ' and not (page.name = ' + quoted(this.archivePage.name) + ')';
-          block.text = '{{tine-query ' + record.expression + '}}';
-        }
       } catch (error) {
         if (!(error instanceof UnsupportedQuery)) throw error;
-        this.querySnapshot(record, block, label, error.message);
+        this.querySnapshot(record, block, error.message);
       }
     }
   }
@@ -633,16 +732,17 @@ export class Converter {
         const views = source.views(identity).length ? source.views(identity) : [null];
         const base = source.setting(identity, 'SYS_A15', {meta: true});
         for (const view of views) block.children.push(this.queryBlock(identity, view, unique([...base, ...(view ? source.setting(view, 'SYS_A15') : [])])));
-        const snapshot = this.generated('snapshot:' + identity, 'Exported results', {collapsed: 'true'});
-        source.children(identity).forEach((child, index) => {
+        source.children(identity).forEach(child => {
           if (source.kind(child) === 'tuple') {
             const values = source.children(child);
             if (values.length && this.fields.has(values[0])) this.emitField(child, values[0], values.slice(1), block);
             else this.issue('search-child-tuple-retained-in-definition', child, {search: identity});
-          } else if (this.emitted.has(child) || this.pageFor.has(child) || source.props(child)._ownerId !== identity) snapshot.children.push(this.occurrence(child, identity, index));
-          else snapshot.children.push(this.emitNode(child));
+          } else if (!this.emitted.has(child) && !this.pageFor.has(child) && source.props(child)._ownerId === identity) {
+            // A note created inside a search is real content. Other children are
+            // cached search hits; their IDs and definitions stay in JSON only.
+            block.children.push(this.emitNode(child));
+          }
         });
-        block.children.push(snapshot);
       }
       while (this.viewsProcessed < this.viewTargets.length) {
         const [identity, block] = this.viewTargets[this.viewsProcessed++];
@@ -651,20 +751,16 @@ export class Converter {
     }
   }
   recoveryPage() {
-    if (!this.recoveredPage) this.recoveredPage = this.newPage('generated:recovered', 'Tana import/Recovered references', 'recovered');
+    if (!this.recoveredPage) this.recoveredPage = this.newPage('generated:recovered', 'Recovered notes', 'recovered');
     return this.recoveredPage;
-  }
-  archivedReferencesPage() {
-    if (!this.archivePage) this.archivePage = this.newPage('generated:archived', 'Tana import/Archived references', 'archived');
-    return this.archivePage;
   }
   recover() {
     const source = this.source;
-    const candidates = [...source.nodes.keys()].filter(identity => !(this.emitted.has(identity) || this.scalarIds.has(identity) || identity.startsWith('SYS_') || !source.active(identity) || !CONTENT_KINDS.has(source.kind(identity)))
+    const candidates = [...source.nodes.keys()].filter(identity => !(this.emitted.has(identity) || this.scalarIds.has(identity) || this.nativeValues.has(identity) || identity.startsWith('SYS_') || !source.active(identity) || !CONTENT_KINDS.has(source.kind(identity)))
       && !source.lineage(identity).slice(1).some(ancestor => METADATA_KINDS.has(source.kind(ancestor)) || source.kind(ancestor) === 'attrDef'));
     candidates.sort((a, b) => source.lineage(a).length - source.lineage(b).length || compare(a, b));
     for (const identity of candidates) {
-      if (this.emitted.has(identity) || this.scalarIds.has(identity)) continue;
+      if (this.emitted.has(identity) || this.scalarIds.has(identity) || this.nativeValues.has(identity)) continue;
       const block = this.emitNode(identity);
       const context = source.lineage(identity).slice(1).find(ancestor => (CONTENT_KINDS.has(source.kind(ancestor)) || ['home', 'tagDef', 'attrDef'].includes(source.kind(ancestor))) && !ancestor.startsWith('SYS_'));
       if (context) block.children.unshift(this.generated('recovered-context:' + identity, 'Original context: ' + this.reference(context)));
@@ -675,11 +771,153 @@ export class Converter {
       const unresolved = sorted([...this.required].filter(identity => !this.emitted.has(identity) && !this.refs.has(identity)));
       if (!unresolved.length) break;
       for (const identity of unresolved) {
-        const page = source.nodes.has(identity) && !source.active(identity) ? this.archivedReferencesPage() : this.recoveryPage();
-        page.blocks.push(this.emitNode(identity));
+        this.recoveryPage().blocks.push(this.emitNode(identity));
         if (source.trashed(identity)) this.issue('referenced-archived-content-recovered', identity);
       }
     }
+  }
+  flattenCalendarsToJournals() {
+    const source = this.source, periods = [], calendars = [];
+    const visit = blocks => blocks.flatMap(block => {
+      if (this.calendarNavigation.has(block.uuid)) return [];
+      block.children = visit(block.children);
+      const identity = block.sourceId, kind = source.kind(identity);
+      if (identity && kind === 'journalPart') { periods.push(block); return []; }
+      if (identity && kind === 'journal') { calendars.push(block); return []; }
+      return [block];
+    });
+    for (const page of [...this.pages.values(), this.index]) if (page.kind !== 'journal') page.blocks = visit(page.blocks);
+    const references = new Set(), pageRefs = new Set();
+    const scan = block => {
+      for (const text of [block.text, ...Object.values(block.properties)]) {
+        for (const match of text.matchAll(/\(\(([\da-f-]{36})\)\)/gi)) references.add(match[1].toLowerCase());
+        for (const match of text.matchAll(/\[\[([^\[\]\r\n]+)\]\]/g)) pageRefs.add(match[1]);
+      }
+      block.children.forEach(scan);
+    };
+    for (const page of [...this.pages.values(), this.index]) {
+      scan({text: '', properties: page.properties, children: page.blocks});
+    }
+    periods.forEach(scan);
+    for (const block of periods) {
+      const identity = block.sourceId, day = this.periodAnchors.get(identity), target = this.refs.get(identity);
+      if (!day || !target) throw new Error('Unmapped calendar period: ' + identity);
+      const hasMetadata = Object.keys(block.properties).length || block.text !== this.title(identity);
+      const referenced = target.type === 'page' ? pageRefs.has(target.target) : references.has(target.target);
+      if (!block.children.length && !hasMetadata && !referenced) {
+        this.required.delete(identity);
+        this.representations.set(identity, {status: 'calendar-navigation', day, period: source.calendarDate(identity)});
+        continue;
+      }
+      const workspace = source.workspace.get(identity), page = this.dayPage(day);
+      page.sourceIds.push(identity);
+      let children = page.blocks;
+      if (workspace !== this.rootWorkspace) {
+        const key = JSON.stringify([workspace, day]);
+        if (!this.dayGroups.has(key)) {
+          const text = this.sharedWorkspaces.has(workspace) ? 'Shared notes: ' + workspace : this.reference(source.homes.get(workspace));
+          const group = new Block(target.target, text, hasMetadata ? null : identity);
+          this.dayGroups.set(key, group);
+          page.blocks.push(group);
+        }
+        children = this.dayGroups.get(key).children;
+      }
+      extend(children, hasMetadata ? [block] : block.children);
+      this.representations.set(identity, {status: 'journal', page: page.name, path: page.path, day, workspace, target, period: source.calendarDate(identity)});
+      this.issue('calendar-period-anchored-to-journal', identity, {period: source.calendarDate(identity), day, workspace});
+    }
+    for (const block of calendars) {
+      const identity = block.sourceId, page = this.pageFor.get(identity);
+      if (block.children.length || Object.keys(block.properties).length || block.text !== this.title(identity)) throw new Error('Calendar has undated authored content: ' + identity);
+      if (references.has(block.uuid)) this.recoveryPage().blocks.push(block);
+      else this.required.delete(identity);
+      this.representations.set(identity, {status: 'calendar-navigation'});
+      if (page && !page.blocks.length && !pageRefs.has(page.name)) {
+        for (const [key, candidate] of this.pages) if (candidate === page) this.pages.delete(key);
+        this.pageFor.delete(identity);
+        this.refs.delete(identity);
+      }
+    }
+  }
+  pruneCalendarMetadata() {
+    // Excluding a calendar supertag can leave a period label with no metadata.
+    // Reconcile that decision without leaving empty week/year placeholders.
+    const references = new Set(), pageRefs = new Set(), removed = [], removedPages = [];
+    const scan = block => {
+      for (const text of [block.text, ...Object.values(block.properties)]) {
+        for (const match of text.matchAll(/\(\(([\da-f-]{36})\)\)/gi)) references.add(match[1].toLowerCase());
+        for (const match of text.matchAll(/\[\[([^\[\]\r\n]+)\]\]/g)) pageRefs.add(match[1]);
+      }
+      block.children.forEach(scan);
+    };
+    for (const page of this.pages.values()) scan({text:'',properties:page.properties,children:page.blocks});
+    const disposableGroups = new Set([...this.dayGroups].filter(([key]) => {
+      const [workspace, day] = JSON.parse(key);
+      return !(this.daySources.get(day) ?? []).some(id => this.source.workspace.get(id) === workspace);
+    }).map(([,group]) => group.uuid));
+    const prune = blocks => blocks.flatMap(block => {
+      block.children = prune(block.children);
+      const identity = block.sourceId;
+      const periodLabel = identity && this.periodAnchors.has(identity) && !isoDay(this.source.calendarDate(identity))
+        && block.uuid === sourceUuid(identity) && block.text.trim() === this.title(identity).trim();
+      if (!Object.keys(block.properties).length && !references.has(block.uuid)
+        && (periodLabel || disposableGroups.has(block.uuid) && !block.children.length)) {
+        removed.push(block.uuid);
+        return block.children;
+      }
+      return [block];
+    });
+    for (const [key,page] of this.pages) if (page.kind === 'journal') {
+      page.blocks = prune(page.blocks);
+      if (!page.blocks.length && !Object.keys(page.properties).length && !pageRefs.has(page.name) && page.sourceIds.length
+        && page.sourceIds.every(id => !isoDay(this.source.calendarDate(id)))) {
+        this.pages.delete(key);
+        removedPages.push(page.path);
+      }
+    }
+    for (const [identity,day] of this.periodAnchors) {
+      const reference = this.refs.get(identity);
+      if ((reference.type === 'block' && removed.includes(reference.target)) || (reference.type === 'page' && !this.pages.has('journal:' + day))) {
+        this.required.delete(identity);
+        this.representations.set(identity,{status:'calendar-navigation',day,period:this.source.calendarDate(identity)});
+      }
+    }
+    return {removed_block_ids:removed,removed_pages:removedPages};
+  }
+  retainWorkspaceNotes() {
+    const references = new Set();
+    const scan = value => { for (const match of value.matchAll(/\(\(([\da-f-]{36})\)\)/gi)) references.add(match[1].toLowerCase()); };
+    const walk = block => {
+      scan(block.text);
+      Object.values(block.properties).forEach(scan);
+      block.children.forEach(walk);
+    };
+    for (const page of this.pages.values()) {
+      Object.values(page.properties).forEach(scan);
+      page.blocks.forEach(walk);
+    }
+    const referenced = block => references.has(block.uuid) || block.children.some(referenced);
+    const content = (block, root = false) => Object.keys(block.properties).length
+      || (!root && (block.sourceId || !/^(?:\[\[[^\n]*\]\]|\(\([\da-f-]{36}\)\))$/i.test(block.text)))
+      || block.children.some(child => content(child));
+    // Keep authored workspace metadata, source-owned notes, and any structural
+    // block that a real note references. Discard redundant navigation lists.
+    const retained = new Set();
+    let changed;
+    do {
+      changed = false;
+      for (const block of this.index.blocks) {
+        if (retained.has(block)) continue;
+        const props = this.source.props(block.sourceId);
+        if (referenced(block) || content(block, true) || props.description || has(props, '_done') || this.source.tags(block.sourceId).length) {
+          retained.add(block);
+          walk(block);
+          changed = true;
+        }
+      }
+    } while (changed);
+    for (const block of this.index.blocks) if (retained.has(block)) this.recoveryPage().blocks.push(block);
+    this.index.blocks = [];
   }
   finish() {
     this.prepare();
@@ -691,11 +929,13 @@ export class Converter {
       this.recover();
     }
     for (const [identity, descriptor] of this.fields) this.pageFor.get(identity).properties['tine.type'] = descriptor.query_type;
-    this.index.blocks.unshift(this.generated('import-intro', 'Tana import\nThe original exports and unsupported metadata are retained as JSON assets. Search result snapshots are the results included in those exports.'));
-    for (const info of this.source.files) this.index.blocks.push(this.generated('source-link:' + info.workspace, '[Source export: ' + info.workspace + '](../assets/tana-source/exports/' + info.workspace + '.json)'));
+    this.pruneQuerySnapshots();
+    this.flattenCalendarsToJournals();
+    this.retainWorkspaceNotes();
     this.issue('source-metadata-retained-in-json', null, {count: [...this.source.nodes.keys()].filter(identity => !this.emitted.has(identity) && !this.scalarIds.has(identity)).length,
       details: 'Includes system definitions, deleted content, unsupported automation/formulas, UI state, and source editor history'});
     this.validateNativeQueries();
+    this.pruneQuerySnapshots();
     this.validateIds();
     return this;
   }
@@ -753,16 +993,17 @@ export class Converter {
         journals: [...this.pages.values()].filter(page => page.kind === 'journal').length,
         node_statuses: countBy(Object.values(nodes).map(node => node.status)), query_statuses: countBy(this.queries.map(query => query.status))},
       nodes, pages: [...this.pages.values()].map(page => ({name: page.name, path: page.path, kind: page.kind, source_ids: page.sourceIds,
-        properties: {title: page.name, ...page.properties}, root_ids: page.blocks.map(block => block.uuid), ...files[page.path]})),
+        properties: pageProperties(page), root_ids: page.blocks.map(block => block.uuid), ...files[page.path]})),
       fields: Object.fromEntries(this.fields), tags: Object.fromEntries(sorted(this.tags).map(identity => [identity, {page: this.pageFor.get(identity).name,
         parents: source.tags(identity).filter(tag => this.tags.has(tag)), expanded_parents: this.expandedTags(identity)}])),
       queries: this.queries, issues: this.issues, renames: this.names.renames, assets: this.assets, expected_blocks: expected,
       fidelity: {source_archives: 'Byte-for-byte export copies under assets/tana-source/exports',
-        queries: 'All-or-nothing conservative translation; every search retains exported results and original definitions',
+        calendar_periods: 'Calendar navigation is omitted; weekly notes use the Sunday starting the week, monthly notes the first day, and yearly notes January 1, grouped by workspace in shared journals',
+        queries: 'All-or-nothing conservative translation; exported result IDs and original definitions are retained in JSON assets, not appended to graph queries',
         tag_inheritance: 'Ancestor tags are materialized on imported instances; future Tine edits do not enforce inheritance',
         templates: 'Exported values, defaults and schemas are retained; Tana automation/default application is not executed',
         graph_properties: 'Only authored fields and required native Tine properties; no generated source metadata properties',
-        source_scopes: 'Named workspaces use native owning-page/ancestor references; root scope excludes named workspace references. Archived references occupy a separate page excluded by live queries; source metadata remains manifest-only',
+        source_scopes: 'Named workspaces use native owning-page/ancestor references; root scope excludes named workspace references. Queries search retained notes without migration-specific page exclusions. Cached search hits do not restore archived notes; explicit note references remain resolvable',
         timestamps: 'Source timestamps are retained in this manifest and the unchanged source archives, not as native Tine edit history'}};
   }
 }

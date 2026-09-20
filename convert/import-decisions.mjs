@@ -237,16 +237,6 @@ export async function applyImportDecisions(graph, decisions, jobs) {
   for (const identity of excludedFields) graph.fields.delete(identity);
   for (const [identity, canonical] of mergedTags) if (identity !== canonical) graph.tags.delete(identity);
   for (const [uuid, tags] of graph.nativeTags) graph.nativeTags.set(uuid, unique(tags.filter(id => !excludedSources.has(id)).map(id => mergedTags.get(id) ?? id)));
-  // Index-only links to excluded definitions should not re-create empty pages.
-  function trimIndex(blocks) {
-    return blocks.filter(block => {
-      const match = block.text.match(/^\[\[([^\[\]\n]+)\]\]$/);
-      const omit = !block.sourceId && !block.children.length && match && Object.hasOwn(mapping.deletedNames, pageIdentity(match[1]));
-      if (omit) removedIds.add(block.uuid);
-      return !omit;
-    }).map(block => { block.children = trimIndex(block.children); return block; });
-  }
-  graph.index.blocks = trimIndex(graph.index.blocks);
   const entries = [...graph.pages], rewritten = await mapWorkers('rewriteDecisionPage', entries.map(([, page]) => ({page, mapping})), jobs);
   entries.forEach(([, page], index) => Object.assign(page, rewritten[index].page));
   for (const query of graph.queries) {
@@ -255,6 +245,8 @@ export async function applyImportDecisions(graph, decisions, jobs) {
   }
   for (const scalar of graph.scalarIds.values()) scalar.property = rw.keyName(scalar.property);
   for (const record of graph.representations.values()) if (record.property) record.property = rw.keyName(record.property);
+  const calendarCleanup = graph.pruneCalendarMetadata();
+  for (const identity of calendarCleanup.removed_block_ids) removedIds.add(identity);
   // Check the widened facet identities as well as the original conservative bounds.
   const scope = new NativeScope(graph);
   function rewriteScope(value) {
@@ -272,6 +264,7 @@ export async function applyImportDecisions(graph, decisions, jobs) {
   const afterBlocks = [...graph.pages.values()].flatMap(page => flatten(page.blocks));
   assert.deepEqual(afterBlocks.map(block => block.uuid).sort(), beforeBlocks.filter(block => !removedIds.has(block.uuid)).map(block => block.uuid).sort(), 'Unapproved block removal');
   const audit = {plan: decisions, removed_source_ids: [...excludedSources], removed_block_ids: [...removedIds],
+    calendar_cleanup: calendarCleanup,
     field_merge_groups: fieldGroups.filter(group => group.sources.length > 1).length,
     page_merge_groups: (decisions.pages ?? []).filter(group => group.sources.length > 1).length,
     removed_pages: deletedPages.size, blocks_before: beforeBlocks.length, blocks_after: afterBlocks.length,

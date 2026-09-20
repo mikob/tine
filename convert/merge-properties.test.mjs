@@ -64,9 +64,9 @@ async function fixture(t) {
   await fs.mkdir(path.join(graph, 'logseq'));
   await fs.mkdir(path.join(graph, 'assets'));
   const docs = {
-    price: 'title:: price\ntine.type:: text\n\n- Price definition\n  id:: 00000000-0000-4000-8000-000000000001\n',
+    price: 'tine.type:: text\n\n- Price definition\n  id:: 00000000-0000-4000-8000-000000000001\n',
     'price-other': 'title:: price-other\ntine.type:: number\n\n- Other definition\n  id:: 00000000-0000-4000-8000-000000000002\n',
-    Records: 'title:: Records\n\n- Current edited record\n  id:: 00000000-0000-4000-8000-000000000003\n  price-other:: 12.30\n- Untouched record\n  id:: 00000000-0000-4000-8000-000000000004\n  price:: $4 / kg\n',
+    Records: '- Current edited record\n  id:: 00000000-0000-4000-8000-000000000003\n  price-other:: 12.30\n- Untouched record\n  id:: 00000000-0000-4000-8000-000000000004\n  price:: $4 / kg\n',
   };
   const pages = Object.entries(docs).map(([name]) => ({name, path: 'pages/' + name + '.md'}));
   const manifest = {converter: 'tana-to-tine', fields: {

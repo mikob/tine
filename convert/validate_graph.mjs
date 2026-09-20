@@ -55,7 +55,7 @@ function checkPage(root, page, expected, wasm) {
       } else properties.push(...syntax.props);
     }
   }
-  const expectedPageProps = Object.entries({ title: page.name, ...page.properties });
+  const expectedPageProps = Object.entries(page.properties);
   if (JSON.stringify(properties) !== JSON.stringify(expectedPageProps)) fail("page-properties", { expected: expectedPageProps, actual: properties });
   if (actual.length !== expected.length) fail("block-count", { expected: expected.length, actual: actual.length });
   const stack = [], ids = [], schemas = [];
@@ -96,7 +96,8 @@ function checkPage(root, page, expected, wasm) {
     parts.push(payload.subarray(offset, end));
     const lines = Buffer.concat(parts).toString("utf8").split("\n");
     const prefix = "\t".repeat(wanted.depth);
-    if (!lines[0].startsWith(prefix + "- ")) fail("block-prefix", { id });
+    // Tine's editor writes a bare bullet when a user clears a block's text.
+    if (lines[0] !== prefix + "-" && !lines[0].startsWith(prefix + "- ")) fail("block-prefix", { id });
     lines[0] = lines[0].slice(prefix.length + 2);
     for (let j = 1; j < lines.length - 1; j++) {
       if (!lines[j].startsWith(prefix + "  ")) fail("continuation-prefix", { id, line: j });

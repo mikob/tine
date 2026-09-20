@@ -6,7 +6,7 @@ import path from 'node:path';
 import {parseArgs} from 'node:util';
 import {pathToFileURL} from 'node:url';
 import {RESERVED_KEYS, INTERNAL_KEYS} from './tana_tine/converter.mjs';
-import {encodePageName, pageIdentity, sha256, isoDay} from './tana_tine/model.mjs';
+import {encodePageName, pageIdentity, pageNameFromPath, sha256, isoDay} from './tana_tine/model.mjs';
 import {availableWorkers, mapConcurrent, mapWorkers} from './workers.mjs';
 import {documentSummary, parser, rewriter, stripSpans} from './property-rewrite.mjs';
 
@@ -98,7 +98,9 @@ export async function stageMerges(graph, plan, stage, jobs = availableWorkers())
   }
   const config = await fs.readFile(path.join(graph, 'logseq/config.edn'), 'utf8');
   if (!/:pages-directory\s+"pages"/.test(config) || !/:journals-directory\s+"journals"/.test(config)
-    || !/:file\/name-format\s+:triple-lowbar/.test(config)) throw new Error('Unsupported graph directory or filename configuration');
+    || !/:file\/name-format\s+:triple-lowbar/.test(config)
+    || !/:journal\/file-name-format\s+"yyyy_MM_dd"/.test(config)
+    || !/:journal\/page-title-format\s+"MMM do, yyyy"/.test(config)) throw new Error('Unsupported graph directory, filename or journal configuration');
   const backup = stage + '.before';
   if (await exists(backup)) throw new Error('Backup already exists: ' + backup);
   await fs.mkdir(stage, {recursive: true});
@@ -107,8 +109,8 @@ export async function stageMerges(graph, plan, stage, jobs = availableWorkers())
     const raw = await fs.readFile(path.join(graph, file), 'utf8');
     await fs.mkdir(path.dirname(path.join(backup, file)), {recursive: true});
     await fs.writeFile(path.join(backup, file), raw, {flag: 'wx'});
-    const page = raw.match(/^title::\s*(.*)$/m)?.[1]?.trim();
-    if (!page) throw new Error('Page has no explicit title: ' + file);
+    const summary = await documentSummary(raw);
+    const page = summary.properties.find(([key]) => key === 'title')?.[1]?.trim() || pageNameFromPath(file);
     return {path: file, page, sha256: sha256(raw), raw};
   });
   const ancillary = {};
@@ -137,7 +139,7 @@ export async function stageMerges(graph, plan, stage, jobs = availableWorkers())
       if (first >= 0) expectedBlocks.push(...stripSpans(ast.blocks.slice(first)));
       outputs.delete(file);
     }
-    assert.equal(headers.get('title'), group.key);
+    if (headers.has('title')) assert.equal(headers.get('title'), group.key);
     assert.equal(headers.get('tine.type'), group.query_type);
     const raw = [...headers].map(([key, value]) => key + '::' + (value ? ' ' + value : '')).join('\n') + '\n\n'
       + bodies.map(body => body.endsWith('\n') || !body ? body : body + '\n').join('');
@@ -161,7 +163,8 @@ export async function stageMerges(graph, plan, stage, jobs = availableWorkers())
       user_edited_since_import: manifest.working_graph?.files?.[file]?.user_edited_since_import
         || snapshots.find(snapshot => snapshot.path === file)?.sha256 !== manifest.pages.find(page => page.path === file)?.sha256};
     const header = Object.fromEntries(summary.properties);
-    if (header['tine.type']) propertyPages[header.title] = {name: header.title, path: file, properties: header};
+    const name = header.title?.trim() || pageNameFromPath(file);
+    if (header['tine.type']) propertyPages[name] = {name, path: file, properties: header};
     await fs.mkdir(path.dirname(path.join(stage, file)), {recursive: true});
     await fs.writeFile(path.join(stage, file), raw, {flag: 'wx'});
   }

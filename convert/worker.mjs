@@ -11,6 +11,10 @@ parentPort.on('message', async ({ task, index, item }) => {
       result = (await import('./tana_tine/model.mjs')).serializePage(item);
     } else if (task === 'discoverExport') {
       result = await (await import('./asset-cache.mjs')).discoverExport(item);
+    } else if (task === 'rewriteProperties') {
+      result = await (await import('./property-rewrite.mjs')).rewriteDocument(item);
+    } else if (task === 'rewriteDecisionPage') {
+      result = await (await import('./import-decisions.mjs')).rewriteDecisionPage(item);
     } else {
       throw new Error(`Unknown worker task: ${task}`);
     }

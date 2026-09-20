@@ -40,9 +40,28 @@ Workspace roles are explicit and optional:
   Otherwise the source home title is retained.
 
 Dates use `journals/YYYY_MM_DD.md` and the configured logical journal title.
-Source calendar outlines remain navigable links to the merged journals. Root
-library entries each receive a page, including entries that already represent a
-tag or a property definition.
+Inline calendar dates link to those journals; ranges link both endpoints. Timed
+references keep their local clock time, precision, UTC offset and timezone next
+to the journal link. All-day dates keep the stated day without a timezone shift.
+Unrecognized date forms remain source text, and original metadata stays in the
+archived exports. Generated page headers only include `title` when the filename
+does not supply the intended name, such as a shortened filename for a long title.
+Source calendar outlines are omitted. Daily notes use their original date;
+weekly notes use the Sunday starting that week (for example, `2025-W17` goes to
+April 20, 2025), monthly notes use the first day of the month, and yearly notes
+use January 1. Notes from the same workspace and date share one workspace
+reference group; root-workspace notes stay at journal root. Empty source periods
+do not create empty journals unless a note references them. No separate week,
+month, or year pages are generated. Authored period metadata and note IDs, tags,
+properties, and children are preserved; the source period stays in the manifest.
+Root library entries each receive a page, including entries that already
+represent a tag or a property definition.
+
+Source `heading` fields with levels 1–6 become Markdown headings. Matching
+headings are kept as written. Redundant `title` fields are omitted, including
+date labels that name the same journal day; a title on an otherwise untitled
+block becomes its visible text. Different titles, conflicting heading levels,
+and rich field values remain source content.
 
 Use repeatable `--field-name SOURCE_FIELD_ID=KEY` options to choose readable
 property names, for example `--field-name rating=score`. Source field IDs are
@@ -54,6 +73,82 @@ Unknown IDs, duplicate overrides, unsafe names, and normalized collisions fail
 before asset processing. Explicit names take precedence; unrelated default
 mappings stay unchanged when possible. Overrides are saved as `field_names` in
 the manifest and are also accepted by `new Converter(source, {fieldNames: {...}})`.
+
+To combine source fields that have the same meaning, use the separate Node.js
+merge command after conversion. It also works on an already edited graph, without
+regenerating its notes. It requires a Tine checkout for the bundled document parser.
+Create a JSON plan using source field IDs from the manifest:
+
+~~~json
+{
+  "groups": [
+    {
+      "key": "quantity",
+      "query_type": "number",
+      "fields": ["SOURCE_FIELD_A", "SOURCE_FIELD_B"]
+    }
+  ]
+}
+~~~
+
+~~~sh
+node tine/convert/merge-properties.mjs converted-graph \
+  --plan property-merges.json --stage merged-stage
+node tine/convert/merge-properties.mjs --publish merged-stage
+~~~
+
+Inspect or open the stage before publishing. Staging checks the parsed syntax of
+every changed document, preserves all block IDs and definition trees, and records
+its checks in property-merge-validation.json. It uses all available cores unless
+--jobs is provided. A sibling merged-stage.before directory retains the original
+Markdown and metadata; the original graph's assets remain in place. The staged
+graph links to those unchanged assets.
+
+Choose one explicit global query type per merge; this does not coerce stored
+values. For example, unit-bearing prices can share a text property, and scalar
+notes can share a list-of-text declaration with list-valued notes. Local
+tine.fields types and enum choices stay attached to their existing views.
+Definition pages are consolidated, and property keys, page links, queries,
+columns, grouping, sorting, aggregates and table widths follow the mapping.
+Code literals remain literal. Conflicting properties on the same owner,
+incompatible duplicate schema entries, affected formulas/filters, occupied page
+names and invalid numeric/date/checkbox values stop staging. Review those cases
+before merging; identical spelling alone is not a reason to merge fields.
+
+Publishing refuses intervening edits and retains the backup. The manifest records
+the merge plan and previous field descriptors under property_merges, while
+working_graph records current file hashes and property pages. Its original
+pages, expected_blocks and counts remain the conversion baseline; the
+original import validator is for that baseline, not subsequent user edits.
+
+For a fresh import, pass --decisions decisions.json to apply source-ID decisions
+before serialization. This supports page/tag merges and definition exclusions as
+well as field merges. It requires the bundled parser in a Tine checkout. Existing
+--field-name overrides can still be used alongside it.
+
+~~~json
+{
+  "fields": [
+    {"sources": ["FIELD_A", "FIELD_B"], "key": "quantity", "query_type": "number"},
+    {"sources": ["FIELD_C"], "key": "contact-email", "query_type": "text"}
+  ],
+  "pages": [
+    {"sources": ["TAG_A", "PAGE_B"], "name": "Research"}
+  ],
+  "exclude_fields": ["UNUSED_FIELD"],
+  "exclude_pages": ["UNUSED_TAG"]
+}
+~~~
+
+The first source in each page group supplies the destination page. All member
+blocks and source identities are retained there in order. Merging a tag keeps
+its membership and updates references and queries. Excluding a tag removes its
+definition and tag markers while retaining the tagged records; excluding a field
+removes its definition and assignments. Ordinary page exclusions remove that
+page's outline, so select source IDs deliberately. Deleted definitions remain in
+the archived exports, and the manifest lists every removed block ID. Conflicting
+values, incompatible page schemas, overlapping decisions and live queries that
+depend on an excluded definition fail the import.
 
 `--jobs` defaults to all CPU cores available to the process. Export parsing,
 attachment discovery and page serialization run on a bounded worker-thread pool. Attachment copying/downloading, page writing and export
@@ -113,16 +208,22 @@ may add newly retrieved attachments.
   substitute fields.
 - Supported search clauses become `{{tine-query …}}` blocks. Translation is
   all-or-nothing for each complete query, so an unknown condition never produces
-  an incorrectly widened live search. **Every search retains its exported result
-  snapshot and original definition**, whether translated or unsupported.
+  an incorrectly widened live search. Every search retains its exported result
+  IDs and original definition in JSON assets. These audit records are not added
+  as child blocks beneath queries. Notes actually authored inside a search stay
+  in its outline; cached result references do not create duplicate placements.
+  Unsupported queries emit no warning/placeholder blocks, and empty search
+  labels are omitted unless a note references them. The reason a query could
+  not be translated remains in `import-manifest.json` alongside its definition.
 - Live queries require a positive tag, task, authored-field, or page-reference condition that
-  excludes generated and inactive records. The converter checks a conservative
+  excludes generated records. The converter checks a conservative
   candidate bound after recovering references: AND intersects bounds, OR unions
   them, and negation or missing-property conditions cannot supply a bound alone.
-  Referenced inactive notes occupy `Tana import/Archived references`; live queries
-  exclude that allocated page by its native page name. Active recovered notes stay
-  on their own page and remain eligible. A possible unwanted match elsewhere
-  disables the entire live query. These queries use
+  Cached search hits do not restore archived notes. Notes explicitly referenced
+  by retained content remain addressable under `Recovered notes`, alongside
+  active notes missing from the exported outline. They participate in native
+  queries like other retained notes, without migration-specific exclusions.
+  A possible generated or missing-source match disables the entire live query. These queries use
   native tags, fields, and references, so future Tine edits participate naturally.
 - Named workspace scopes become native `ref('Workspace page')` predicates. They
   include blocks on that page and blocks referencing it directly or through an
@@ -137,11 +238,12 @@ may add newly retrieved attachments.
 - Source ownership, child placements, links, and calendar context remain distinct
   manifest data. Workspace searches use the native reference scopes described
   above. Other unsupported source relationships and direct-child views remain
-  explicit snapshots/retained outlines, with their full definitions linked.
+  retained outlines and JSON snapshots, with definition paths in the manifest.
 - Tana defaults, formulas, commands, automation, unknown UI settings, deleted
   records, and editor history are retained in the source archives. They are not
-  silently executed or assigned invented Tine behavior. Referenced deleted notes
-  remain addressable by their stable block references on the excluded archive page.
+  silently executed or assigned invented Tine behavior. Directly referenced
+  deleted notes retain their stable block IDs; unreferenced deleted content stays
+  in the source archives. No migration index or separate archive page is created.
 
 ## Output and audit trail
 

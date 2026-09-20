@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {Source, Names, isoDay, serializePage, Page, Block} from './tana_tine/model.mjs';
+import {Source, Names, isoDay, calendarAnchor, serializePage, encodePageName, pageNameFromPath, Page, Block} from './tana_tine/model.mjs';
 import {Converter, decimalNumber} from './tana_tine/converter.mjs';
 
 const node = (id, name, owner, kind = 'node', children = []) => ({id, props: {name, _ownerId: owner, _docType: kind}, children});
@@ -20,6 +20,60 @@ test('calendar validation rejects normalized invalid days and accepts Gregorian 
   assert.equal(isoDay('2024-02-29'), '2024-02-29');
   assert.equal(isoDay('2024-02-29T12:00:00Z'), null);
   for (const value of ['1900-02-29', '2025-02-29', '2024-04-31', '2024-00-01', '0000-01-01']) assert.throws(() => isoDay(value), RangeError);
+});
+
+test('period anchors use Sunday-start weeks, including ISO year boundaries and leap years', () => {
+  for (const [period, day] of [['2025-W17','2025-04-20'], ['2020-W01','2019-12-29'], ['2020-W53','2020-12-27'],
+    ['2021-W01','2021-01-03'], ['2024-W09','2024-02-25'], ['2025-09','2025-09-01'], ['2025','2025-01-01'], ['2024-02-29','2024-02-29']]) {
+    assert.equal(calendarAnchor(period), day);
+  }
+  for (const period of ['2021-W53', '2025-W00', '2025-W54', '2025-13', '0000', '2025-02-29']) assert.throws(() => calendarAnchor(period), RangeError);
+  assert.equal(calendarAnchor('Week 17'), null);
+});
+
+test('inline days and range endpoints become journals without timezone JSON', () => {
+  const graph = new Converter(source('Example'));
+  assert.equal(graph.dateReference({dateTimeString: '2025-11-21', timezone: 'America/Mexico_City'}), '[[Nov 21st, 2025]]');
+  assert.equal(graph.dateReference({dateTimeString: '2025-11-26/2025-11-28', timezone: 'America/Mexico_City'}),
+    '[[Nov 26th, 2025]] – [[Nov 28th, 2025]]');
+  assert.deepEqual([...graph.pages.values()].filter(page => page.kind === 'journal').map(page => page.path),
+    ['journals/2025_11_21.md', 'journals/2025_11_26.md', 'journals/2025_11_28.md']);
+  assert.equal(graph.dateReference({dateTimeString: '2025-11-21', timezone: 'America/Mexico_City'}, true), '2025-11-21');
+});
+
+test('inline periods retain their labels while linking to native daily anchors', () => {
+  const graph = new Converter(source('Example'));
+  assert.equal(graph.dateReference({dateTimeString:'2025-W17',timezone:'America/Mexico_City'}),'[2025-W17]([[Apr 20th, 2025]])');
+  assert.equal(graph.dateReference({dateTimeString:'2025-09'}),'[2025-09]([[Sep 1st, 2025]])');
+  assert.equal(graph.dateReference({dateTimeString:'2025'}),'[2025]([[Jan 1st, 2025]])');
+  assert.equal(graph.dateReference({dateTimeString:'2025-W17'},true),'2025-W17');
+  assert.throws(()=>graph.dateReference({dateTimeString:'2021-W53'}),RangeError);
+});
+
+test('timed references preserve clock precision, offsets and zones on both endpoints', () => {
+  const graph = new Converter(source('Example'));
+  assert.equal(graph.dateReference({dateTimeString: '2025-06-12T19:00:00.000/2025-06-13T00:15:00.123', timezone: 'America/Mexico_City', hasTime: true}),
+    '[[Jun 12th, 2025]] 19:00:00.000 – [[Jun 13th, 2025]] 00:15:00.123 (America/Mexico_City)');
+  assert.equal(graph.dateReference({dateTimeString: '2025-06-12T23:30-06:00'}), '[[Jun 12th, 2025]] 23:30-06:00');
+  assert.equal(graph.dateReference({dateTimeString: '2025-06-12T00:15Z'}), '[[Jun 12th, 2025]] 00:15Z');
+  assert.equal(graph.dateReference({dateTimeString: 'Invalid DateTime', timezone: 'UTC'}), 'Invalid DateTime ({"timezone": "UTC"})');
+  assert.equal(graph.dateReference({dateTimeString: '2025-06-12', extra: 'retain'}), '[[Jun 12th, 2025]] ({"extra": "retain"})');
+  assert.throws(() => graph.dateReference({dateTimeString: '2025-02-29'}), RangeError);
+});
+
+test('page headers omit redundant titles but preserve filename overrides', () => {
+  for (const name of ['Project/Roadmap', 'a___b', 'CON.txt', 'Café', '50% progress']) {
+    const filename = 'pages/' + encodePageName(name) + '.md';
+    assert.equal(pageNameFromPath(filename), name);
+    const [, content] = serializePage(new Page(name, filename, 'root', [], {}, [new Block('id', 'Note')]));
+    assert.ok(content.startsWith('- Note\n'));
+  }
+  assert.equal(pageNameFromPath('journals/2025_11_21.md'), 'Nov 21st, 2025');
+  assert.equal(pageNameFromPath('pages/2025-02-29.md'), '2025-02-29');
+  assert.equal(pageNameFromPath('pages/%xx%25.md'), '%xx%');
+  assert.equal(serializePage(new Page('Nov 21st, 2025', 'journals/2025_11_21.md', 'journal'))[1], '\n');
+  assert.match(serializePage(new Page('Long name', 'pages/page-hash.md', 'root'))[1], /^title:: Long name\n/);
+  assert.match(serializePage(new Page('Filename', 'pages/Filename.md', 'root', [], {title: 'Authored override'}))[1], /^title:: Authored override\n/);
 });
 
 test('portable filename allocation disambiguates Unicode case folds and bounds UTF-8 size', () => {

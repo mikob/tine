@@ -5,11 +5,13 @@ import { beforeEach, describe, test } from "node:test";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Converter } from "./tana_tine/converter.mjs";
+import { Converter, titleMatchesDay } from "./tana_tine/converter.mjs";
 import { Block, Names, Page, Source, encodePageName, safeProse, serializePage, sourceUuid } from "./tana_tine/model.mjs";
 import { Compiler, NativeScope, UnsupportedQuery } from "./tana_tine/queries.mjs";
 import { RichText, codeFence, escapeSourceHashtags } from "./tana_tine/richtext.mjs";
 import { parseFieldNames, parseArgs, run } from "./tana-to-tine.mjs";
+import { applyImportDecisions, recordImportDecisions } from "./import-decisions.mjs";
+import {parser} from './property-rewrite.mjs';
 
 function node(identity, name = "", { kind = "node", owner = null, children = [], ...props } = {}) {
   const data = { name, _docType: kind, created: 1700000000000, ...props };
@@ -72,6 +74,193 @@ const convert = (exports = fixture(), options = {}) => new Converter(new Source(
   rootWorkspace: "Root", sharedWorkspaces: ["Shared"], ...options,
 }).finish();
 
+function fieldValue(exports, owner, field, name, value, suffix = '') {
+  const tuple = `${owner}-${field}-tuple${suffix}`, scalar = `${tuple}-value`;
+  if (!record(exports.Shared, field)) exports.Shared.docs.push(node(field, name, {kind: 'attrDef', owner: 's-home'}));
+  const workspaceData = Object.values(exports).find(data => record(data, owner));
+  record(workspaceData, owner).children.push(tuple);
+  workspaceData.docs.push(node(tuple, '', {kind: 'tuple', owner, children: [field, scalar]}), node(scalar, value, {owner: tuple}));
+  return scalar;
+}
+
+test('heading fields become native headings without changing nested content or task markers', async () => {
+  const exports = fixture();
+  record(exports.Root, 'daily').props.name = 'TODO Follow up';
+  fieldValue(exports, 'daily', 'heading-field', 'heading', '3');
+  fieldValue(exports, 'book', 'heading-field', 'heading', '2');
+  record(exports.Root, 'book').props.name = '## A Book';
+  const graph = convert(exports), expected = blocks(graph), parse = await parser();
+  const daily = expected.find(b => b.source_id === 'daily');
+  assert.equal(daily.text, '### TODO Follow up');
+  assert.equal(daily.properties['source-heading'], undefined);
+  assert.ok(expected.find(b => b.source_id === 'book').text.startsWith('## A Book '));
+  const page = [...graph.pages.values()].find(p => p.path === daily.path);
+  const syntax = parse(serializePage(page)[1]).blocks.find(b => b.kind === 'bullet');
+  assert.equal(syntax.size, 3);
+  assert.equal(syntax.marker, 'TODO');
+  assert.equal(expected.filter(b => b.source_id === 'code').length, 1);
+});
+
+test('invalid, conflicting and rich heading fields stay lossless', () => {
+  const exports = fixture();
+  fieldValue(exports, 'daily', 'heading-field', 'heading', '7');
+  fieldValue(exports, 'book', 'heading-field', 'heading', '2');
+  record(exports.Root, 'book').props.name = '# A Book';
+  const rich = fieldValue(exports, 'work-daily', 'heading-field', 'heading', '3');
+  record(exports.Work, rich).children.push('heading-note');
+  exports.Work.docs.push(node('heading-note', 'Authored context', {owner: rich}));
+  const expected = blocks(convert(exports));
+  assert.equal(expected.find(b => b.source_id === 'daily').properties['source-heading'], '7');
+  assert.equal(expected.find(b => b.source_id === 'book').properties['source-heading'], '2');
+  assert.ok(expected.find(b => b.source_id === 'heading-note'));
+});
+
+test('duplicate titles and date labels disappear, blank titles become visible, distinct titles survive', () => {
+  const exports = fixture();
+  fieldValue(exports, 'book', 'title-field', 'title', 'A Book');
+  fieldValue(exports, 'day', 'title-field', 'title', '2025/01/02');
+  fieldValue(exports, 'work-daily', 'title-field', 'title', 'Alternate title');
+  record(exports.Root, 'daily').props.name = '';
+  fieldValue(exports, 'daily', 'title-field', 'title', 'Visible title');
+  const graph = convert(exports), expected = blocks(graph);
+  assert.equal(expected.find(b => b.source_id === 'book').properties['source-title'], undefined);
+  assert.equal(graph.dayPage('2025-01-02').properties['source-title'], undefined);
+  assert.equal(expected.find(b => b.source_id === 'daily').text, 'Visible title');
+  assert.equal(expected.find(b => b.source_id === 'work-daily').properties['source-title'], 'Alternate title');
+  assert.equal(titleMatchesDay('2019/21/05', '2019-05-21'), true);
+  assert.equal(titleMatchesDay('2019/01/05', '2019-05-01'), false);
+});
+
+test('rich title values and native scalar reference targets retain their content', () => {
+  const exports = fixture();
+  const title = fieldValue(exports, 'book', 'title-field', 'title', 'A Book');
+  record(exports.Root, title).children.push('title-note');
+  exports.Root.docs.push(node('title-note', 'Title context', {owner: title}));
+  const heading = fieldValue(exports, 'daily', 'heading-field', 'heading', '2');
+  record(exports.Work, 'work-daily').props.name += ` <span data-inlineref-node="${heading}"></span>`;
+  const expected = blocks(convert(exports));
+  assert.ok(expected.find(b => b.source_id === 'book').properties['source-title']);
+  assert.ok(expected.find(b => b.source_id === 'title-note'));
+  assert.ok(expected.find(b => b.source_id === heading));
+});
+
+test('unsupported query placeholders disappear while definitions and authored children remain', () => {
+  const exports = fixture();
+  exports.Root.docs.push(node('unknown', 'IS UNKNOWN', {owner: 'query-expr'}));
+  record(exports.Root, 'query-expr').children.push('unknown');
+  const graph = convert(exports), expected = blocks(graph), query = queryFor(graph, 'query');
+  assert.equal(query.status, 'snapshot');
+  assert.equal(query.visible, false);
+  assert.ok(graph.definitions.has(query.source_definition_path));
+  assert.ok(!expected.some(b => b.uuid === query.uuid || b.source_id === 'query'));
+  assert.ok(!expected.some(b => /Source search:|Live query unavailable:/.test(b.text)));
+  exports.Root.docs.push(node('search-note', 'Authored child', {owner: 'query'}));
+  record(exports.Root, 'query').children.push('search-note');
+  const retained = blocks(convert(exports));
+  assert.ok(retained.some(b => b.source_id === 'query'));
+  assert.ok(retained.some(b => b.source_id === 'search-note'));
+});
+
+test('referenced unsupported search labels stay resolvable', () => {
+  const exports = fixture();
+  record(exports.Root, 'r-home').children = ['calendar'];
+  record(exports.Root, 'day').children.push('query');
+  record(exports.Root, 'query').props._ownerId = 'day';
+  exports.Root.docs.push(node('unknown', 'IS UNKNOWN', {owner: 'query-expr'}));
+  record(exports.Root, 'query-expr').children.push('unknown');
+  record(exports.Root, 'daily').props.name += ' <span data-inlineref-node="query"></span>';
+  const graph = convert(exports);
+  assert.ok(blocks(graph).some(b => b.source_id === 'query'));
+  graph.validateIds();
+});
+
+test('weekly projects join Sunday journals without calendar outlines or duplicate workspace groups', () => {
+  const exports = fixture();
+  record(exports.Work, 'work-calendar').children.push('year');
+  exports.Work.docs.push(
+    node('year', '2025', {kind: 'journalPart', owner: 'work-calendar', children: ['week']}),
+    node('week', 'Week 17', {kind: 'journalPart', owner: 'year', children: ['weekly-project'], _metaNodeId: 'week-meta'}),
+    node('week-meta', '', {kind: 'metanode', owner: 'week', children: ['week-date']}),
+    node('week-date', '', {kind: 'tuple', owner: 'week-meta', children: ['SYS_A169', 'week-value']}),
+    node('week-value', '<span data-inlineref-date="{&quot;dateTimeString&quot;:&quot;2025-W17&quot;}"></span>', {owner: 'week-date'}),
+    node('weekly-project', 'An important project', {owner: 'week', children: ['project-note']}),
+    node('project-note', 'Preserved plan', {owner: 'weekly-project'}),
+    node('w-root_TRASH', '', {owner: 'w-root', children: ['weekly-project']}),
+  );
+  addTags(exports.Work, 'weekly-project', 'tag-book');
+  record(exports.Work, 'work-day').props.name = '2025-04-20';
+  const graph = convert(exports), page = graph.pageFor.get('w-home'), expected = blocks(graph);
+  const sunday = graph.dayPage('2025-04-20'), group = sunday.blocks.find(b => b.text === '[[Work Space]]');
+  assert.deepEqual(group.children.map(b=>b.sourceId), ['work-daily', 'weekly-project']);
+  assert.equal(graph.refs.get('week').target, group.uuid);
+  assert.ok(!page.blocks.some(b=>['year','week','work-calendar'].includes(b.sourceId)));
+  assert.equal(page.blocks.at(-1).sourceId, 'w-root_STASH');
+  assert.equal(expected.filter(b => b.source_id === 'weekly-project').length, 1);
+  assert.equal(expected.find(b => b.source_id === 'project-note').parent, sourceUuid('weekly-project'));
+  assert.equal([...graph.pages.values()].filter(p => p.kind === 'journal').length, 2);
+  assert.ok(![...graph.pages.values()].some(p => p.kind === 'calendar-period' || p.name === 'Calendar'));
+  assert.ok(new NativeScope(graph).candidates(['and', [['tag', 'tag-book'], ['ref', 'Work Space']]]).has(sourceUuid('weekly-project')));
+});
+
+test('month and year notes join January 1 while root-workspace notes remain at journal root', () => {
+  const exports = fixture();
+  for (const workspaceName of ['Root', 'Work']) {
+    const data = exports[workspaceName], calendar = workspaceName === 'Root' ? 'calendar' : 'work-calendar';
+    const year = workspaceName + '-year', month = workspaceName + '-month';
+    record(data, calendar).children.push(year);
+    data.docs.push(node(year, '2025', {kind:'journalPart',owner:calendar,children:[month,year+'-note']}),
+      node(month,'2025-01',{kind:'journalPart',owner:year,children:[month+'-note']}),
+      node(year+'-note','Annual note',{owner:year}),node(month+'-note','Monthly note',{owner:month}));
+  }
+  const graph = convert(exports), journal = graph.dayPage('2025-01-01');
+  assert.deepEqual(journal.blocks.filter(b=>b.sourceId?.startsWith('Root-')).map(b=>b.sourceId).sort(),['Root-month-note','Root-year-note']);
+  const groups = journal.blocks.filter(b=>b.text==='[[Work Space]]');
+  assert.equal(groups.length,1);
+  assert.deepEqual(groups[0].children.map(b=>b.sourceId).sort(),['Work-month-note','Work-year-note']);
+  assert.ok(![...graph.pages.values()].some(p=>p.name==='2025'||p.name==='2025-01'||p.name==='Calendar'));
+});
+
+test('references to empty periods resolve without materializing unrelated empty weeks or years', () => {
+  const exports=fixture();
+  exports.Work.docs.push(node('empty-period','2025-02',{kind:'journalPart',owner:'work-calendar'}),
+    node('unused-period','2026',{kind:'journalPart',owner:'work-calendar'}));
+  record(exports.Work,'work-calendar').children.push('empty-period','unused-period');
+  record(exports.Root,'daily').props.name += ' <span data-inlineref-node="empty-period"></span>';
+  const graph=convert(exports),expected=blocks(graph);
+  assert.ok(graph.pages.has('journal:2025-02-01'));
+  assert.ok(!graph.pages.has('journal:2026-01-01'));
+  const group=graph.dayPage('2025-02-01').blocks[0];
+  assert.equal(group.text,'[[Work Space]]');
+  assert.ok(expected.find(b=>b.source_id==='daily').text.includes('(('+group.uuid+'))'));
+  graph.validateIds();
+});
+
+test('period properties and descriptions survive their move to a daily journal', () => {
+  const exports=fixture();
+  exports.Work.docs.push(node('month','2025-02',{kind:'journalPart',owner:'work-calendar',description:'Planning notes'}));
+  record(exports.Work,'work-calendar').children.push('month');
+  fieldValue(exports,'month','rating','Rating','4');
+  const graph=convert(exports),month=blocks(graph).find(b=>b.source_id==='month');
+  assert.equal(month.path,'journals/2025_02_01.md');
+  assert.equal(month.properties.rating,'4');
+  assert.equal(graph.dayPage('2025-02-01').blocks[0].children[0].children[0].text,'Planning notes');
+});
+
+test('excluding a calendar supertag does not leave empty period labels or journals', async () => {
+  const exports=fixture();
+  exports.Shared.docs.push(node('week-tag','Week',{kind:'tagDef',owner:'s-home'}));
+  exports.Work.docs.push(node('month','2025-02',{kind:'journalPart',owner:'work-calendar'}));
+  record(exports.Work,'work-calendar').children.push('month');
+  addTags(exports.Work,'month','week-tag');
+  const graph=convert(exports);
+  assert.ok(graph.pages.has('journal:2025-02-01'));
+  const audit=await applyImportDecisions(graph,{exclude_pages:['week-tag']},2);
+  assert.ok(!graph.pages.has('journal:2025-02-01'));
+  assert.ok(audit.calendar_cleanup.removed_pages.includes('journals/2025_02_01.md'));
+  assert.ok(!blocks(graph).some(b=>b.source_id==='month'));
+  graph.validateIds();
+});
+
 function addTags(exportData, identity, ...tags) {
   const meta = `${identity}-test-meta`;
   const assignment = `${identity}-test-tags`;
@@ -79,6 +268,55 @@ function addTags(exportData, identity, ...tags) {
   exportData.docs.push(node(meta, "", { kind: "metanode", owner: identity, children: [assignment] }),
     node(assignment, "", { kind: "tuple", owner: meta, children: ["SYS_A13", ...tags] }));
 }
+
+test("import decisions merge typed fields and tag pages while excluding only selected definitions", async () => {
+  const exports = fixture();
+  exports.Shared.docs.push(
+    node("rating-peer", "Rating", {kind: "attrDef", owner: "s-home"}),
+    node("old-field", "Old field", {kind: "attrDef", owner: "s-home"}),
+    node("old-tag", "Old tag", {kind: "tagDef", owner: "s-home"}),
+  );
+  record(exports.Shared, "s-home").children.push("rating-peer", "old-field", "old-tag");
+  record(exports.Root, "daily").children.push("peer-value");
+  exports.Root.docs.push(node("peer-value", "", {kind: "tuple", owner: "daily", children: ["rating-peer", "peer-number"]}),
+    node("peer-number", "12 hours", {owner: "peer-value"}));
+  addTags(exports.Root, "daily", "old-tag");
+  const graph = convert(exports), originalIds = new Set(blocks(graph).map(b => b.uuid));
+  const audit = await applyImportDecisions(graph, {
+    fields: [{sources: ["rating", "rating-peer"], key: "rating", query_type: "text"}],
+    pages: [{sources: ["tag-book", "book"], name: "Book"}],
+    exclude_fields: ["old-field"], exclude_pages: ["old-tag"],
+  }, 2);
+  assert.equal(graph.pageFor.get("book"), graph.pageFor.get("tag-book"));
+  assert.equal(graph.fields.get("rating-peer").key, "rating");
+  assert.equal(graph.fields.get("rating").query_type, "text");
+  assert.equal(graph.fields.get("rating").sheet_type, "number");
+  assert.ok(blocks(graph).some(b => b.properties.rating === "12 hours"));
+  assert.ok(blocks(graph).some(b => b.properties.rating === "0"));
+  assert.ok(blocks(graph).some(b => b.source_id === "daily"));
+  assert.ok(!blocks(graph).some(b => b.text.includes("#[[Old tag]]")));
+  assert.ok(blocks(graph).every(b => originalIds.has(b.uuid)));
+  assert.equal(originalIds.size - blocks(graph).length, audit.removed_block_ids.length);
+  const manifest = graph.manifest(blocks(graph), {});
+  recordImportDecisions(manifest, graph);
+  assert.equal(manifest.nodes["old-field"].status, "excluded-by-decision");
+  assert.equal(manifest.nodes["old-tag"].status, "excluded-by-decision");
+  assert.equal(manifest.fields["rating-peer"].page, "rating");
+});
+
+test("import decisions refuse conflicting values and duplicate page targets", async () => {
+  const exports = fixture();
+  exports.Shared.docs.push(node("rating-peer", "Rating", {kind: "attrDef", owner: "s-home"}));
+  record(exports.Root, "book").children.push("second-rating");
+  exports.Root.docs.push(node("second-rating", "", {kind: "tuple", owner: "book", children: ["rating-peer", "second-number"]}),
+    node("second-number", "2", {owner: "second-rating"}));
+  await assert.rejects(applyImportDecisions(convert(exports), {
+    fields: [{sources: ["rating", "rating-peer"], key: "rating", query_type: "text"}],
+  }, 1), /Conflicting properties/);
+  await assert.rejects(applyImportDecisions(convert(), {
+    pages: [{sources: ["book"], name: "Book"}],
+  }, 1), /collides/);
+});
 
 describe("format", () => {
   test("filename encoder and collisions", () => {
@@ -241,13 +479,36 @@ describe("conversion", () => {
     }
   });
 
-  test("queries keep source and snapshots", () => {
+  test("query definitions and cached results stay outside graph content", () => {
     const query = queryFor(graph, "query");
     assert.equal(query.status, "translated");
     assert.ok(query.expression.includes("tag('Record')"));
     assert.deepEqual(query.result_ids, ["book"]);
     assert.ok(graph.definitions.has(query.source_definition_path));
-    assert.ok(expected.some((block) => block.text === "Exported results"));
+    assert.ok(!expected.some(block => block.text === "Exported results" || block.text.includes("Original search and view definition")));
+    assert.ok(![...graph.pages.values()].some(page => page.name.startsWith("Tana import")));
+  });
+
+  test("notes authored inside a search survive without a results wrapper", () => {
+    const exports = fixture();
+    exports.Root.docs.push(node("inside-search", "An authored note", {owner: "query"}));
+    record(exports.Root, "query").children.push("inside-search");
+    const converted = convert(exports), result = blocks(converted);
+    assert.equal(result.filter(block => block.source_id === "inside-search").length, 1);
+    assert.equal(result.find(block => block.source_id === "inside-search").parent, sourceUuid("query"));
+    assert.deepEqual(queryFor(converted, "query").result_ids, ["book", "inside-search"]);
+  });
+
+  test("authored workspace metadata and directly referenced workspace anchors survive", () => {
+    for (const mode of ["description", "reference"]) {
+      const exports = fixture();
+      if (mode === "description") record(exports.Root, "r-home").props.description = "Authored workspace note";
+      else record(exports.Root, "daily").props.name += ' <span data-inlineref-node="r-home">Root</span>';
+      const converted = convert(exports), result = blocks(converted);
+      assert.equal(result.filter(block => block.source_id === "r-home").length, 1);
+      assert.equal(converted.recoveredPage.name, "Recovered notes");
+      if (mode === "description") assert.ok(result.some(block => block.text === "Authored workspace note"));
+    }
   });
 
   test("graph has only authored and native properties", () => {
@@ -265,7 +526,7 @@ describe("conversion", () => {
     assert.equal(manifest.nodes.prose.done, false);
   });
 
-  test("inactive tag matches are kept on an excluded archive page", () => {
+  test("cached query results do not restore archived tag matches", () => {
     const exports = fixture();
     exports.Root.docs.push(
       node("r-root_TRASH", "", { owner: "r-root" }),
@@ -277,11 +538,9 @@ describe("conversion", () => {
     const converted = convert(exports);
     const query = queryFor(converted, "query");
     assert.equal(query.status, "translated");
-    assert.ok(query.expression.includes("not (page.name = 'Tana import/Archived references')"));
-    assert.equal(query.scope_validation.excluded_candidates, 1);
-    assert.equal(converted.archivePage.blocks[0].uuid, sourceUuid("archived"));
-    assert.equal(converted.archivePage.blocks[0].sourceId, "archived");
-    assert.ok(converted.emitted.has("archived"));
+    assert.equal(query.expression, "@block and (tag('Record'))");
+    assert.ok(!converted.emitted.has("archived"));
+    assert.ok(query.result_ids.includes("archived"));
   });
 
   test("active recovered tag match remains live", () => {
@@ -294,9 +553,20 @@ describe("conversion", () => {
     const query = queryFor(converted, "query");
     assert.equal(query.status, "translated");
     assert.equal(query.scope_validation.candidate_count, 1);
-    assert.equal(query.scope_validation.excluded_candidates, 1);
     assert.ok(converted.recoveredPage.blocks.some((block) => block.sourceId === "book"));
-    assert.ok(converted.archivePage.blocks.some((block) => block.sourceId === "archived"));
+    assert.ok(!converted.emitted.has("archived"));
+  });
+
+  test("explicitly referenced archived notes remain ordinary queryable notes", () => {
+    const exports = fixture();
+    exports.Root.docs.push(node("r-root_TRASH", "", {owner: "r-root"}), node("archived", "Referenced book", {owner: "r-root_TRASH"}));
+    addTags(exports.Root, "archived", "tag-book");
+    record(exports.Root, "daily").props.name += ' <span data-inlineref-node="archived">Book</span>';
+    const converted = convert(exports), query = queryFor(converted, "query");
+    assert.equal(query.status, "translated");
+    assert.equal(query.scope_validation.candidate_count, 2);
+    assert.equal(query.expression, "@block and (tag('Record'))");
+    assert.ok(converted.recoveredPage.blocks.some(block => block.sourceId === "archived"));
   });
 
   test("unbounded OR clause cannot widen native query", () => {
@@ -315,8 +585,8 @@ describe("conversion", () => {
     const compiler = new Compiler(graph, "query");
     assert.equal(compiler.compile(["rating"]), "@block and (prop('rating') is not null)");
     assert.equal(new NativeScope(graph).validate(compiler.scope).candidate_count, 1);
-    graph.index.blocks.push(graph.generated("generated-rating", "Summary", { rating: "1" }));
-    assert.throws(() => new NativeScope(graph).validate(compiler.scope), /inactive or generated/);
+    graph.pageFor.get("book").blocks.push(graph.generated("generated-rating", "Summary", { rating: "1" }));
+    assert.throws(() => new NativeScope(graph).validate(compiler.scope), /generated/);
   });
 
   test("workspace scope uses native page and ancestor references", () => {
@@ -351,7 +621,6 @@ describe("conversion", () => {
       record(exports.Root, "query-expr").children.push("w-home");
       const query = queryFor(convert(exports), "query");
       assert.equal(query.status, "translated");
-      assert.equal(query.scope_validation.excluded_candidates, Number(mentionsWorkspace));
       assert.equal(query.scope_validation.candidate_count, 0);
     }
   });
